@@ -2,7 +2,7 @@ import cv2
 import pickle
 
 # Webcam settings
-cam_id = 1  # Change if needed
+cam_id = '../chessvid2.mp4'  # Change if needed
 width, height = 1280, 720
 
 # Open webcam
