@@ -39,6 +39,7 @@ In the latest update, the chessboard is detected automatically from the webcam f
 - A working external camera (e.g., via the Iriun Webcam App to use your phone as a camera) [Iriun website](https://iriun.com/)
 - Make sure your smart phone and pc are connected to the same wifi network when running Iriun on your pc and phone
 - Stockfish chess engine (download from [Stockfish website](https://stockfishchess.org/download/))
+- YOLO chess piece model `chess.pt` (download from [Google Drive](https://drive.google.com/drive/folders/1U2TNd5IYTdHvQC1QEWKOrykBnaUSf1Lv?usp=sharing))
 - clone the repository
   ```bash
   git clone https://github.com/donsolo-khalifa/chessAI.git
@@ -53,12 +54,16 @@ Install the required packages using pip:
 pip install -r requirements.txt
 ```
 ### Usage
-- **1. Update Stockfish Path**
-Change the StockFish path
-```python
-stockfish = Stockfish(path="C:/Users/Presision/Downloads/stockfish-windows-x86-64/stockfish/stockfish-windows-x86-64.exe")
+- **1. Configure your environment**
+Copy `.env.example` to `.env` and set the values for your machine:
+```bash
+cp .env.example .env
 ```
-on line 27 in `main.py` to your own StockFish path. Then run:
+- `STOCKFISH_PATH`: full path to your Stockfish executable (optional if `stockfish` is on your `PATH`)
+- `YOLO_MODEL_PATH`: path to the YOLO weights (default `chess.pt`)
+- `CAMERA_ID`: webcam index (`0` built-in, `1` second camera such as Iriun) or a video file path
+
+Download the YOLO weights file `chess.pt` from [Google Drive](https://drive.google.com/drive/folders/1U2TNd5IYTdHvQC1QEWKOrykBnaUSf1Lv?usp=sharing) and place it in the project root, then run:
 ```bash
 python main.py
 ```

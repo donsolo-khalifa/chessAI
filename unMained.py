@@ -1,4 +1,6 @@
 import math
+import os
+import shutil
 import cv2
 import numpy as np
 import pickle
@@ -6,6 +8,7 @@ import cvzone
 from ultralytics import YOLO
 import chess
 import logging
+from dotenv import load_dotenv
 from stockfish import Stockfish  # New import
 
 # -----------------------------------------------------------------------------
@@ -16,15 +19,20 @@ logging.getLogger("ultralytics").setLevel(logging.ERROR)
 # -----------------------------------------------------------------------------
 # Configuration and Initialization
 # -----------------------------------------------------------------------------
-CAMERA_ID = '../chessvid2.mp4'
+load_dotenv()
+
+# Camera index (e.g. 0, 1) or a video file path; set CAMERA_ID in .env
+CAMERA_ID = os.getenv("CAMERA_ID", "../chessvid2.mp4")
+CAMERA_ID = int(CAMERA_ID) if CAMERA_ID.isdigit() else CAMERA_ID
 WIDTH, HEIGHT = 1280, 720
-YOLO_MODEL_PATH = "chess.pt"
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "chess.pt")
 DETECTION_CONFIDENCE_THRESHOLD = 0.6
 DISPLAY_SIZE = (1280, 720)
 BOARD_MARGIN = 100
 
-# Initialize Stockfish (update path to your Stockfish executable)
-stockfish = Stockfish(path="C:/Users/Presision/Downloads/stockfish-windows-x86-64/stockfish/stockfish-windows-x86-64.exe")
+# Initialize Stockfish (set STOCKFISH_PATH in .env, or have "stockfish" on your PATH)
+STOCKFISH_PATH = os.getenv("STOCKFISH_PATH") or shutil.which("stockfish") or "stockfish"
+stockfish = Stockfish(path=STOCKFISH_PATH)
 
 COLUMNS = "abcdefgh"
 ROWS = "12345678"

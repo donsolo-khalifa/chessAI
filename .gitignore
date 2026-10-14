@@ -1,1 +1,6 @@
 *chess.pt
+.venv/
+__pycache__/
+.env
+stockfish/
+*.mp4

@@ -5,3 +5,5 @@ mediapipe
 ultralytics
 python-chess
 stockfish
+pyttsx3
+python-dotenv
