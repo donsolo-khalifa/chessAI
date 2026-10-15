@@ -36,9 +36,8 @@ CROP_OFFSET = 0  # Pixels to crop from each side after warping||change back to 3
 
 # Initialize Stockfish (set STOCKFISH_PATH in .env, or have "stockfish" on your PATH)
 STOCKFISH_PATH = os.getenv("STOCKFISH_PATH") or shutil.which("stockfish") or "stockfish"
-stockfish = Stockfish(path=STOCKFISH_PATH)
-
-stockfishBlack = Stockfish(path=STOCKFISH_PATH)
+# turn_perspective=False: all scores are from White's point of view, so White and Black evals compare directly
+stockfish = Stockfish(path=STOCKFISH_PATH, turn_perspective=False)
 
 COLUMNS = "abcdefgh"
 ROWS = "12345678"
@@ -50,13 +49,9 @@ piece_to_fen = {
     'black-rook': 'r', 'black-queen': 'q', 'black-king': 'k'
 }
 
-# Use a chess.Board for debugging; FENs will be built manually.
-chess_board = chess.Board()
-chess_board_black = chess.Board()
-prev_board_white = chess.Board()
-prev_board_black = chess.Board()
+game = None          # Last accepted position; None until the first valid scan
+turn_known = False   # Side to move is unknown on a fresh scan, known once a move has been seen
 move_history = []
-current_fen_candidate = None
 
 model = YOLO(YOLO_MODEL_PATH)
 names = model.names
@@ -284,6 +279,101 @@ def square_to_pixel(square, board_size):
 
 
 # ---------------------------------------------------------------------------
+# Game Tracking
+# ---------------------------------------------------------------------------
+def board_for_side(board, side):
+    """
+    Copy of the board with `side` to move. En passant only survives for the real side to move.
+    """
+    b = board.copy(stack=False)
+    if b.turn != side:
+        b.turn = side
+        b.ep_square = None
+    return b
+
+
+def find_move(board, placement):
+    """
+    Return the legal move on the board that produces `placement`, or None.
+    """
+    for m in board.legal_moves:
+        board.push(m)
+        hit = board.board_fen() == placement
+        board.pop()
+        if hit:
+            return m
+    return None
+
+
+def resync(stable_fen):
+    """
+    Start tracking from the detected position, with the side to move unknown.
+    Returns False if the position isn't legal for either side (e.g. a king is missing).
+    """
+    global game, turn_known
+    board = chess.Board(stable_fen)
+    if not any(board_for_side(board, s).is_valid() for s in (chess.WHITE, chess.BLACK)):
+        return False
+    game, turn_known = board, False
+    return True
+
+
+def update_game(stable_fen):
+    """
+    Advance the tracked game to a newly stable detected position.
+    Returns (side, san) if a legal move explains the change, otherwise None.
+    Positions no legal move explains (hand over the board, misdetections) leave the game untouched.
+    """
+    global game, turn_known
+    placement = stable_fen.split(' ')[0]
+    if game is None or placement == game.board_fen():
+        return None
+    # Once a move has been seen, sides alternate: try the expected side first,
+    # then the other one in case a move was missed.
+    sides = [game.turn, not game.turn] if turn_known else [chess.WHITE, chess.BLACK]
+    for side in sides:
+        board = board_for_side(game, side)
+        if not board.is_valid():  # e.g. the other king is in check, so it can't be this side's turn
+            continue
+        move = find_move(board, placement)
+        if move:
+            san = board.san(move)
+            board.push(move)
+            game, turn_known = board, True
+            return side, san
+    return None
+
+
+def analyse_both_sides(board):
+    """
+    Top 3 moves for each side. A side gets [] when it can't be its turn
+    (the other king is in check) or it has no moves. Stockfish crashes on such positions.
+    """
+    result = {}
+    for side in (chess.WHITE, chess.BLACK):
+        b = board_for_side(board, side)
+        if b.is_valid() and not b.is_game_over():
+            stockfish.set_fen_position(b.fen())
+            result[side] = stockfish.get_top_moves(3)
+        else:
+            result[side] = []
+    return result
+
+
+def describe_eval(board, top_moves):
+    """
+    Evaluation of the board from White's point of view, as text.
+    """
+    if board.is_checkmate():
+        return "0-1" if board.turn == chess.WHITE else "1-0"
+    if not top_moves:
+        return "0.00"
+    if top_moves[0]["Mate"] is not None:
+        return f"M{top_moves[0]['Mate']}"
+    return f"{top_moves[0]['Centipawn'] / 100:+.2f}"
+
+
+# ---------------------------------------------------------------------------
 # Main Loop with Automatic Board Detection, Cropping, and Rotation
 # ---------------------------------------------------------------------------
 def main():
@@ -291,6 +381,8 @@ def main():
     stable_fen = ""  # FEN candidate that is being confirmed
     fen_counter = 0
     STABILITY_THRESHOLD = 5  # Frames required for stability
+    RESYNC_THRESHOLD = 60  # Frames an unexplained position must hold before tracking restarts from it
+    analysed_fen = None  # Position the current best moves belong to
     best_moves_white = []  # Top moves for White
     best_moves_black = []  # Top moves for Black
 
@@ -302,7 +394,7 @@ def main():
     rotation_state = 0
 
 
-    global prev_board_white,prev_board_black, move_history, chess_board_black,current_fen_candidate,chess_board
+    global move_history
 
     speaker_thread = threading.Thread(target=workerSpeak, daemon=True)
     speaker_thread.start()
@@ -367,14 +459,8 @@ def main():
             img_warped_cropped = draw_chess_grid(img_warped_cropped, new_board_size)
             detected_pieces = detect_pieces(img_warped_cropped, new_board_size)
 
-            # Create a FEN candidate from detections
+            # Create a FEN candidate from detections (turn is a placeholder; the tracker works out the real one)
             current_fen_candidate = create_fen_from_detections(detected_pieces, current_turn='w')
-            current_fen_candidate_black = create_fen_from_detections(detected_pieces, current_turn='b')
-
-            # turn_char = 'w' if chess_board.fen().split(' ')[0] == chess_board_black.fen().split(' ')[0] else 'b'
-            # current_fen_candidate = create_fen_from_detections(detected_pieces, current_turn=turn_char)
-            # current_fen_candidate_black = create_fen_from_detections(detected_pieces, current_turn='b')
-
 
             # Stability check for FEN detection over consecutive frames
             if current_fen_candidate.split(' ')[0] == stable_fen.split(' ')[0]:
@@ -383,287 +469,58 @@ def main():
                 stable_fen = current_fen_candidate
                 fen_counter = 1
 
+            # Resync if the board settles on a position no single legal move explains
+            # (missed moves, board reset, first scan misread, ...)
+            if (fen_counter >= RESYNC_THRESHOLD and game is not None
+                    and stable_fen.split(' ')[0] != game.board_fen() and resync(stable_fen)):
+                print("No legal move explains the board - resynced, side to move unknown")
+                last_stable_fen = None  # force analysis below
+
             if fen_counter >= STABILITY_THRESHOLD and stable_fen != last_stable_fen:
                 last_stable_fen = stable_fen
+                if game is None:
+                    resync(stable_fen)  # first scan
+                played = update_game(stable_fen)
 
-                try:
-                    stable_fen_black = f"{stable_fen.split(' ')[0]} b {stable_fen.split(' ')[2]} - 0 1"
-                    temp_board_black = chess.Board(stable_fen_black)
-                    temp_board = chess.Board(stable_fen)
+                if game is None or game.board_fen() != stable_fen.split(' ')[0]:
+                    print("Board doesn't match a legal move yet (hand over board?):", stable_fen)
+                elif game.fen() != analysed_fen:
+                    analysed_fen = game.fen()
+                    try:
+                        analysis = analyse_both_sides(game)
+                    except Exception as e:
+                        print("Stockfish error:", e)
+                        analysis = {chess.WHITE: [], chess.BLACK: []}
+                    best_moves_white = analysis[chess.WHITE]
+                    best_moves_black = analysis[chess.BLACK]
 
-                    if temp_board.is_check() or temp_board_black.is_check():
-                        speak("check")
-                        print("check")
+                    if played:
+                        side, san = played
+                        move_history.append({
+                            'turn': 'White' if side == chess.WHITE else 'Black',
+                            'move': san,
+                            'eval': describe_eval(game, analysis[game.turn]),
+                        })
 
-                    if temp_board.is_checkmate() or temp_board_black.is_checkmate():
-                        speak("mate")
-                        print("mate")
-                        # break
+                    for side in (chess.WHITE, chess.BLACK):
+                        b = board_for_side(game, side)
+                        if b.is_valid() and b.is_check():
+                            speak("checkmate" if b.is_checkmate() else "check")
+                            break
 
-                    if temp_board.is_valid():
-                        chess_board.set_fen(stable_fen)
-                        # added
-                        # chess_board_black.set_fen(current_fen_candidate_black)
-                        # if prev_board_black.is_check():
-                        #     speak("check")
-                        #     print("check")
-
-                        print("\nUpdated Chess Board:")
-                        print(chess_board)
-                        # print(temp_board)
-                        print("Stable FEN:", stable_fen)
-                        fen_white = f"{stable_fen.split(' ')[0]} w {stable_fen.split(' ')[2]} - 0 1"
-                        fen_black = f"{stable_fen.split(' ')[0]} b {stable_fen.split(' ')[2]} - 0 1"
-                        # if chess_board.is_check():
-                        #     speak("check")
-                        #     print("check")
-                        try:
-
-                            stockfish.set_fen_position(fen_white)
-                            best_moves_white = stockfish.get_top_moves(3)
-
-                            new_board = chess.Board(fen_white)
-
-                            # find actual move from prev_board
-                            played = None
-                            for m in prev_board_white.pseudo_legal_moves:
-                                tb = prev_board_white.copy()
-                                tb.push(m)
-                                # if tb.is_check():
-                                #     speak("Check")
-                                #     print("check white")
-                                if tb.board_fen().split(' ')[0] == new_board.board_fen().split(' ')[0]:
-                                    played = m
-                                    break
-                            if played:
-                                san = prev_board_white.san(played)
-                                turn = 'White' if prev_board_white.turn == chess.WHITE else 'Black'
-                                stockfish.set_fen_position(fen_white)
-                                eval_info = stockfish.get_evaluation()
-                                cp = eval_info.get('value')
-                                move_history.append({'turn': turn, 'move': san, 'evaluation_cp': cp})
-                                # if prev_board_white.is_checkmate():
-                                #     speak("Checkmate White")
-                                # elif prev_board_white.is_check():
-                                #     speak("Check White")
-                                # speak('working')
-                            prev_board_white = new_board
-                            chess_board.set_fen(fen_white)
-                            last_stable_fen = stable_fen
-                            # print("Move History:")
-                            # for h in move_history:
-                            #     print(f"{h['turn']} {h['move']} => {h['evaluation_cp']} cp")
-
-                        except Exception as e:
-                            print("Error getting top moves for White:", e)
-                            best_moves_white = []
-                        try:
-                            stockfish.set_fen_position(fen_black)
-                            best_moves_black = stockfish.get_top_moves(3)
-
-                            new_board = chess.Board(fen_black)
-
-                            # find actual move from prev_board_black
-                            black_check_fen = ""
-                            played = None
-                            for m in prev_board_black.pseudo_legal_moves:
-                                tb = prev_board_black.copy()
-                                tb.push(m)
-
-                                if tb.board_fen().split(' ')[0] == new_board.board_fen().split(' ')[0]:
-                                    played = m
-                                    black_check_fen = tb.board_fen()
-                                    # if tb.is_into_check():
-                                    #     speak("Check")
-                                    #     print("check black")
-                                    break
-                            if played:
-                                fen_black = f"{fen_black.split(' ')[0]} b {fen_black.split(' ')[2]} - 0 1"
-
-                                san = prev_board_black.san(played)
-                                turn = 'White' if prev_board_black.turn == chess.WHITE else 'Black'
-                                stockfish.set_fen_position(fen_black)
-                                chess_board_black.set_fen(black_check_fen)
-                                # if chess_board.is_check():
-                                #     speak("check")
-                                #     print("check")
-                                eval_info = stockfish.get_evaluation()
-                                cp = eval_info.get('value')
-                                move_history.append({'turn': turn, 'move': san, 'evaluation_cp': cp})
-                                # if prev_board_black.is_checkmate():
-                                #     speak("Checkmate Black")
-                                # elif prev_board_black.is_check():
-                                #     speak("Check Black")
-
-                            prev_board_black = new_board
-                            chess_board.set_fen(fen_black)
-                            # test
-                            # chess_board_black.set_fen(fen_black)
-                            last_stable_fen = stable_fen
-                            # if chess_board_black.is_check():
-                            #     speak("check")
-                            #     print("check")
-
-                            # print("Move History:")
-                            # for h in move_history:
-                            #     print(f"{h['turn']} {h['move']} => {h['evaluation_cp']} cp")
-                        except Exception as e:
-                            print("Error getting top moves for Black:", e)
-                            best_moves_black = []
-                        print("Top moves for White:", best_moves_white)
-                        print("Top moves for Black:", best_moves_black)
-
-                    else:
-                        print("white board not working brev temp board below")
-                        # stable_fen = stable_fen_black
-                        # temp_board.set_fen(stable_fen_black)
-                        print(temp_board)
-
-                        if temp_board_black.is_valid():
-                            print('good black board brev')
-                            chess_board_black.set_fen(stable_fen_black)
-                            # added
-                            # chess_board_black.set_fen(current_fen_candidate_black)
-                            # if prev_board_black.is_check():
-                            #     speak("check")
-                            #     print("check")
-
-                            print("\nUpdated Chess Board:")
-                            print(chess_board_black)
-                            # print(temp_board)
-                            print("Stable FEN:", stable_fen_black)
-                            fen_white = f"{stable_fen_black.split(' ')[0]} w {stable_fen_black.split(' ')[2]} - 0 1"
-                            fen_black = f"{stable_fen_black.split(' ')[0]} b {stable_fen_black.split(' ')[2]} - 0 1"
-                            # if chess_board.is_check():
-                            #     speak("check")
-                            #     print("check")
-
-                            try:
-                                stockfishBlack.set_fen_position(fen_black)
-                                best_moves_black = stockfishBlack.get_top_moves(3)
-
-                                new_board = chess.Board(fen_black)
-
-                                # find actual move from prev_board_black
-                                black_check_fen = ""
-                                played = None
-                                for m in prev_board_black.pseudo_legal_moves:
-                                    tb = prev_board_black.copy()
-                                    tb.push(m)
-
-                                    if tb.board_fen().split(' ')[0] == new_board.board_fen().split(' ')[0]:
-                                        played = m
-                                        # black_check_fen = tb.board_fen()
-                                        # if tb.is_into_check():
-                                        #     speak("Check")
-                                        #     print("check black")
-                                        break
-                                if played:
-                                    fen_black = f"{fen_black.split(' ')[0]} b {fen_black.split(' ')[2]} - 0 1"
-
-                                    san = prev_board_black.san(played)
-                                    turn = 'White' if prev_board_black.turn == chess.WHITE else 'Black'
-                                    stockfishBlack.set_fen_position(fen_black)
-                                    chess_board_black.set_fen(black_check_fen)
-                                    # if chess_board.is_check():
-                                    #     speak("check")
-                                    #     print("check")
-                                    eval_info = stockfishBlack.get_evaluation()
-                                    cp = eval_info.get('value')
-                                    move_history.append({'turn': turn, 'move': san, 'evaluation_cp': cp})
-                                    # if prev_board_black.is_checkmate():
-                                    #     speak("Checkmate Black")
-                                    # elif prev_board_black.is_check():
-                                    #     speak("Check Black")
-
-                                prev_board_black = new_board
-                                chess_board_black.set_fen(stable_fen_black)
-                                # test
-                                # chess_board_black.set_fen(fen_black)
-                                last_stable_fen = stable_fen
-                                # if chess_board_black.is_check():
-                                #     speak("check")
-                                #     print("check")
-
-                                # print("Move History:")
-                                # for h in move_history:
-                                #     print(f"{h['turn']} {h['move']} => {h['evaluation_cp']} cp")
-                            except Exception as e:
-                                print("Error getting top moves for Black:", e)
-                                best_moves_black = []
-
-                            try:
-
-                                stockfishBlack.set_fen_position(fen_white)
-                                best_moves_white = stockfishBlack.get_top_moves(3)
-
-                                new_board = chess.Board(fen_black)
-
-                                # find actual move from prev_board
-                                played = None
-                                for m in prev_board_white.pseudo_legal_moves:
-                                    tb = prev_board_white.copy()
-                                    tb.push(m)
-                                    # if tb.is_check():
-                                    #     speak("Check")
-                                    #     print("check white")
-                                    if tb.board_fen().split(' ')[0] == new_board.board_fen().split(' ')[0]:
-                                        played = m
-                                        break
-                                if played:
-                                    san = prev_board_white.san(played)
-                                    turn = 'White' if prev_board_white.turn == chess.WHITE else 'Black'
-                                    stockfishBlack.set_fen_position(fen_white)
-                                    eval_info = stockfishBlack.get_evaluation()
-                                    cp = eval_info.get('value')
-                                    move_history.append({'turn': turn, 'move': san, 'evaluation_cp': cp})
-                                    # if prev_board_white.is_checkmate():
-                                    #     speak("Checkmate White")
-                                    # elif prev_board_white.is_check():
-                                    #     speak("Check White")
-                                    # speak('working')
-                                prev_board_white = new_board
-                                chess_board_black.set_fen(fen_white)
-                                last_stable_fen = stable_fen
-                                # print("Move History:")
-                                # for h in move_history:
-                                #     print(f"{h['turn']} {h['move']} => {h['evaluation_cp']} cp")
-
-                            except Exception as e:
-                                print("Error getting top moves for White:", e)
-                                best_moves_white = []
-
-                            print("Top moves for White:", best_moves_white)
-                            print("Top moves for Black:", best_moves_black)
-
-
-                    # else:
-                    #     print("Detected FEN is not valid:", stable_fen)
-                    #     best_moves_white = best_moves_black = []
-                    #     # else_fen = chess_board.fen()
-                    #     # fen_black = f"{else_fen.split(' ')[0]} b {else_fen.split(' ')[2]} - 0 1"
-                    #     # temp_board.set_fen(fen_black)
-                    #     # fen_black = f"{stable_fen.split(' ')[0]} b {stable_fen.split(' ')[2]} - 0 1"
-                    #     # stable_fen = fen_black
-                    #     # chess_board.set_fen(fen_black)
-                    #     stable_fen = stable_fen_black
-                    #     # chess_board = chess_board_black.copy()
-                    #
-                    #     print(f"else fen {stable_fen_black}")
-
-                except Exception as e:
-                    print("Error processing FEN:", stable_fen, e)
-                    best_moves_white = best_moves_black = []
-
-                # print move history
-                print("Move History:")
-                for h in move_history:
-                    print(f"{h['turn']} {h['move']} ⇒ {h['evaluation_cp']} cp")
+                    print("\nUpdated Chess Board:")
+                    print(game)
+                    print("Side to move:", ("White" if game.turn == chess.WHITE else "Black") if turn_known else "unknown")
+                    print("Top moves for White:", best_moves_white)
+                    print("Top moves for Black:", best_moves_black)
+                    print("Move History:")
+                    for h in move_history:
+                        print(f"{h['turn']} {h['move']} => {h['eval']}")
 
             y0 = 30
             dy = 30
-            for i, h in enumerate(move_history):  # show last 10 moves
-                text = f"{h['turn']} {h['move']} => {h['evaluation_cp']} cp"
+            for i, h in enumerate(move_history[-20:]):  # show last 20 moves (more runs off the image)
+                text = f"{h['turn']} {h['move']} => {h['eval']}"
                 cv2.putText(
                     imgBlank,
                     text,
